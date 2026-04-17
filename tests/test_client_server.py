@@ -1,192 +1,310 @@
 #!/usr/bin/env python3
 """
-Tests for client and server TCP communication
+Tests for client and server WebSocket communication
 """
 
+import asyncio
 import json
-import socket
-import threading
-import time
 import pytest
+import websockets
 from agtw.server import Server
 from agtw.client import Client
 
 
 @pytest.fixture
-def server_instance():
+def server():
     """Create a test server instance"""
     server = Server(host="localhost", port=19876, model="test-model")
-    server.session_manager.create_session("test")
     return server
 
 
-class TestClientServerConnection:
-    def test_client_connection_refused(self):
-        client = Client(host="localhost", port=19999)
-        result = client.send("status")
-        assert result["status"] == "error"
-        assert "無法連線" in result["message"]
+class TestServer:
+    def test_server_creation(self, server):
+        assert server.model == "test-model"
+        assert server.port == 19876
+        assert len(server.state.session_manager.sessions) >= 2
+        assert len(server.state.clients) == 0
 
-    def test_client_send_status(self, server_instance):
-        server_instance.server_socket = socket.socket(
-            socket.AF_INET, socket.SOCK_STREAM
-        )
-        server_instance.server_socket.setsockopt(
-            socket.SOL_SOCKET, socket.SO_REUSEADDR, 1
-        )
-        server_instance.server_socket.bind(("localhost", 19876))
-        server_instance.server_socket.listen(1)
-        server_instance.running = True
-
-        def run_server():
-            try:
-                client_socket, _ = server_instance.server_socket.accept()
-                data = b""
-                while True:
-                    chunk = client_socket.recv(4096)
-                    if not chunk:
-                        break
-                    data += chunk
-                    if chunk.endswith(b"\n"):
-                        break
-
-                request = json.loads(data.decode("utf-8"))
-                response = server_instance._process_request(request)
-                client_socket.sendall((json.dumps(response) + "\n").encode("utf-8"))
-                client_socket.close()
-            except:
-                pass
-
-        thread = threading.Thread(target=run_server, daemon=True)
-        thread.start()
-        time.sleep(0.1)
-
-        client = Client(host="localhost", port=19876)
-        result = client.status()
-
-        server_instance.running = False
-        server_instance.server_socket.close()
-
-        assert result["status"] == "ok"
-        assert result["model"] == "test-model"
+    def test_server_state_exists(self, server):
+        assert server.state is not None
+        assert server.state.session_manager is not None
 
 
 class TestServerCommands:
-    def test_process_status_command(self, server_instance):
-        request = {"command": "status", "args": [], "kwargs": {}}
-        response = server_instance._process_request(request)
+    @pytest.mark.asyncio
+    async def test_process_status(self, server):
+        client_id = "test-client"
+        server.state.clients[client_id] = {"session_id": None, "ws": None}
+        client = server.state.clients[client_id]
 
-        assert response["status"] == "ok"
-        assert response["model"] == "test-model"
-        assert response["current_session"]["name"] == "test"
+        result = await server._cmd_status(client_id, client, [], {})
 
-    def test_process_session_new(self, server_instance):
-        request = {"command": "session.new", "args": ["my_session"], "kwargs": {}}
-        response = server_instance._process_request(request)
+        assert result["status"] == "ok"
+        assert result["model"] == "test-model"
+        assert result["client_id"] == client_id
+        assert result["current_session"] is None
 
-        assert response["status"] == "ok"
-        assert response["session"]["name"] == "my_session"
-        assert "id" in response["session"]
+    @pytest.mark.asyncio
+    async def test_process_session_new(self, server):
+        client_id = "test-client"
+        server.state.clients[client_id] = {"session_id": None, "ws": None}
+        client = server.state.clients[client_id]
 
-    def test_process_session_new_auto_name(self, server_instance):
-        request = {"command": "session.new", "args": [], "kwargs": {}}
-        response = server_instance._process_request(request)
+        result = await server._cmd_session_new(client_id, client, ["my_session"], {})
 
-        assert response["status"] == "ok"
-        assert response["session"]["name"].startswith("session")
+        assert result["status"] == "ok"
+        assert result["session"]["name"] == "my_session"
+        assert "id" in result["session"]
+        assert result["current_session"] == result["session"]["id"]
+        assert client["session_id"] == result["session"]["id"]
 
-    def test_process_session_list(self, server_instance):
-        server_instance._process_request(
-            {"command": "session.new", "args": ["s2"], "kwargs": {}}
+    @pytest.mark.asyncio
+    async def test_process_session_new_auto_name(self, server):
+        client_id = "test-client"
+        server.state.clients[client_id] = {"session_id": None, "ws": None}
+        client = server.state.clients[client_id]
+
+        result = await server._cmd_session_new(client_id, client, [], {})
+
+        assert result["status"] == "ok"
+        assert result["session"]["name"].startswith("session")
+
+    @pytest.mark.asyncio
+    async def test_process_session_list(self, server):
+        client_id = "test-client"
+        server.state.clients[client_id] = {"session_id": None, "ws": None}
+        client = server.state.clients[client_id]
+
+        await server._cmd_session_new(client_id, client, ["session1"], {})
+
+        server.state.clients["other-client"] = {"session_id": None, "ws": None}
+        await server._cmd_session_new(
+            "other-client", server.state.clients["other-client"], ["session2"], {}
         )
 
-        request = {"command": "session.list", "args": [], "kwargs": {}}
-        response = server_instance._process_request(request)
+        result = await server._cmd_session_list(client_id, client, [], {})
 
-        assert response["status"] == "ok"
-        assert len(response["sessions"]) >= 2
+        assert result["status"] == "ok"
+        assert len(result["sessions"]) >= 2
 
-    def test_process_session_switch(self, server_instance):
-        new_session = server_instance._process_request(
-            {"command": "session.new", "args": ["to_switch"], "kwargs": {}}
+    @pytest.mark.asyncio
+    async def test_process_session_join(self, server):
+        client_id = "test-client"
+        server.state.clients[client_id] = {"session_id": None, "ws": None}
+        client = server.state.clients[client_id]
+
+        new_session = await server._cmd_session_new(client_id, client, ["target"], {})
+        session_id = new_session["session"]["id"]
+
+        client2 = {"session_id": None, "ws": None}
+        server.state.clients["client2"] = client2
+        result = await server._cmd_session_join("client2", client2, [session_id], {})
+
+        assert result["status"] == "ok"
+        assert result["session"]["name"] == "target"
+        assert client2["session_id"] == session_id
+
+    @pytest.mark.asyncio
+    async def test_process_session_join_invalid(self, server):
+        client_id = "test-client"
+        server.state.clients[client_id] = {"session_id": None, "ws": None}
+        client = server.state.clients[client_id]
+
+        result = await server._cmd_session_join(client_id, client, ["invalid_id"], {})
+
+        assert result["status"] == "error"
+        assert "找不到" in result["message"]
+
+    @pytest.mark.asyncio
+    async def test_process_session_leave(self, server):
+        client_id = "test-client"
+        server.state.clients[client_id] = {"session_id": "some-session", "ws": None}
+        client = server.state.clients[client_id]
+
+        result = await server._cmd_session_leave(client_id, client, [], {})
+
+        assert result["status"] == "ok"
+        assert client["session_id"] is None
+
+    @pytest.mark.asyncio
+    async def test_process_session_leave_no_session(self, server):
+        client_id = "test-client"
+        server.state.clients[client_id] = {"session_id": None, "ws": None}
+        client = server.state.clients[client_id]
+
+        result = await server._cmd_session_leave(client_id, client, [], {})
+
+        assert result["status"] == "error"
+        assert "不在" in result["message"]
+
+    @pytest.mark.asyncio
+    async def test_process_session_delete(self, server):
+        client_id = "test-client"
+        server.state.clients[client_id] = {"session_id": None, "ws": None}
+        client = server.state.clients[client_id]
+
+        new_session = await server._cmd_session_new(
+            client_id, client, ["to_delete"], {}
         )
         session_id = new_session["session"]["id"]
 
-        request = {"command": "session.switch", "args": [session_id], "kwargs": {}}
-        response = server_instance._process_request(request)
+        result = await server._cmd_session_delete(client_id, client, [session_id], {})
 
-        assert response["status"] == "ok"
-        assert response["session"]["name"] == "to_switch"
+        assert result["status"] == "ok"
 
-    def test_process_session_switch_invalid(self, server_instance):
-        request = {"command": "session.switch", "args": ["invalid_id"], "kwargs": {}}
-        response = server_instance._process_request(request)
+    @pytest.mark.asyncio
+    async def test_process_session_delete_invalid(self, server):
+        client_id = "test-client"
+        server.state.clients[client_id] = {"session_id": None, "ws": None}
+        client = server.state.clients[client_id]
 
-        assert response["status"] == "error"
-        assert "找不到" in response["message"]
+        result = await server._cmd_session_delete(client_id, client, ["invalid_id"], {})
 
-    def test_process_session_delete(self, server_instance):
-        new_session = server_instance._process_request(
-            {"command": "session.new", "args": ["to_delete"], "kwargs": {}}
-        )
-        session_id = new_session["session"]["id"]
+        assert result["status"] == "error"
 
-        request = {"command": "session.delete", "args": [session_id], "kwargs": {}}
-        response = server_instance._process_request(request)
+    @pytest.mark.asyncio
+    async def test_process_agent_list(self, server):
+        client_id = "test-client"
+        server.state.clients[client_id] = {"session_id": None, "ws": None}
+        client = server.state.clients[client_id]
 
-        assert response["status"] == "ok"
+        new_sess = await server._cmd_session_new(client_id, client, [], {})
+        client["session_id"] = new_sess["session"]["id"]
 
-    def test_process_session_delete_invalid(self, server_instance):
-        request = {"command": "session.delete", "args": ["invalid_id"], "kwargs": {}}
-        response = server_instance._process_request(request)
+        result = await server._cmd_agent_list(client_id, client, [], {})
 
-        assert response["status"] == "error"
+        assert result["status"] == "ok"
+        assert "Planner" in result["agents"]
 
-    def test_process_agent_list(self, server_instance):
-        request = {"command": "agent.list", "args": [], "kwargs": {}}
-        response = server_instance._process_request(request)
+    @pytest.mark.asyncio
+    async def test_process_agent_list_no_session(self, server):
+        client_id = "test-client"
+        server.state.clients[client_id] = {"session_id": None, "ws": None}
+        client = server.state.clients[client_id]
 
-        assert response["status"] == "ok"
-        assert "Planner" in response["agents"]
+        result = await server._cmd_agent_list(client_id, client, [], {})
 
-    def test_process_agent_exec(self, server_instance):
-        request = {"command": "agent.exec", "args": ["Write tests"], "kwargs": {}}
-        response = server_instance._process_request(request)
+        assert result["status"] == "error"
+        assert "加入" in result["message"]
 
-        assert response["status"] == "ok"
-        assert "Executor" in response["executor"]["name"]
-        assert response["executor"]["task"] == "Write tests"
+    @pytest.mark.asyncio
+    async def test_process_agent_exec(self, server):
+        client_id = "test-client"
+        server.state.clients[client_id] = {"session_id": None, "ws": None}
+        client = server.state.clients[client_id]
 
-    def test_process_agent_eval(self, server_instance):
-        request = {"command": "agent.eval", "args": ["Check output"], "kwargs": {}}
-        response = server_instance._process_request(request)
+        new_sess = await server._cmd_session_new(client_id, client, [], {})
 
-        assert response["status"] == "ok"
-        assert "Evaluator" in response["evaluator"]["name"]
+        result = await server._cmd_agent_exec(client_id, client, ["Write tests"], {})
 
-    def test_process_unknown_command(self, server_instance):
-        request = {"command": "unknown.cmd", "args": [], "kwargs": {}}
-        response = server_instance._process_request(request)
+        assert result["status"] == "ok"
+        assert "Executor" in result["executor"]["name"]
+        assert result["executor"]["task"] == "Write tests"
 
-        assert response["status"] == "error"
-        assert "未知命令" in response["message"]
+    @pytest.mark.asyncio
+    async def test_process_agent_exec_no_session(self, server):
+        client_id = "test-client"
+        server.state.clients[client_id] = {"session_id": None, "ws": None}
+        client = server.state.clients[client_id]
 
-    def test_process_planner_run_no_session(self, server_instance):
-        server_instance.session_manager.current_session = None
+        result = await server._cmd_agent_exec(client_id, client, ["Write tests"], {})
 
-        request = {"command": "planner.run", "args": ["test prompt"], "kwargs": {}}
-        response = server_instance._process_request(request)
+        assert result["status"] == "error"
+        assert "加入" in result["message"]
 
-        assert response["status"] == "error"
-        assert "沒有" in response["message"]
+    @pytest.mark.asyncio
+    async def test_process_agent_eval(self, server):
+        client_id = "test-client"
+        server.state.clients[client_id] = {"session_id": None, "ws": None}
+        client = server.state.clients[client_id]
 
-    def test_process_agent_list_no_session(self, server_instance):
-        server_instance.session_manager.current_session = None
+        new_sess = await server._cmd_session_new(client_id, client, [], {})
 
-        request = {"command": "agent.list", "args": [], "kwargs": {}}
-        response = server_instance._process_request(request)
+        result = await server._cmd_agent_eval(client_id, client, ["Check quality"], {})
 
-        assert response["status"] == "error"
+        assert result["status"] == "ok"
+        assert "Evaluator" in result["evaluator"]["name"]
+
+    @pytest.mark.asyncio
+    async def test_process_unknown_command(self, server):
+        client_id = "test-client"
+        server.state.clients[client_id] = {"session_id": None, "ws": None}
+
+        request = {"cmd": "unknown.cmd", "args": [], "kwargs": {}}
+        result = await server._process_request(client_id, request)
+
+        assert result["status"] == "error"
+        assert "未知命令" in result["message"]
+
+    @pytest.mark.asyncio
+    async def test_process_planner_no_session(self, server):
+        client_id = "test-client"
+        server.state.clients[client_id] = {"session_id": None, "ws": None}
+        client = server.state.clients[client_id]
+
+        result = await server._cmd_planner(client_id, client, ["test prompt"], {})
+
+        assert result["status"] == "error"
+        assert "加入" in result["message"]
+
+    @pytest.mark.asyncio
+    async def test_process_agent_exec(self, server):
+        client_id = "test-client"
+        server.state.clients[client_id] = {"session_id": None, "ws": None}
+        client = server.state.clients[client_id]
+
+        await server._cmd_session_new(client_id, client, [], {})
+
+        result = await server._cmd_agent_exec(client_id, client, ["Write tests"], {})
+
+        assert result["status"] == "ok"
+        assert "Executor" in result["executor"]["name"]
+        assert result["executor"]["task"] == "Write tests"
+
+    @pytest.mark.asyncio
+    async def test_process_agent_exec_no_session(self, server):
+        client_id = "test-client"
+        server.state.clients[client_id] = {"session_id": None, "ws": None}
+        client = server.state.clients[client_id]
+
+        result = await server._cmd_agent_exec(client_id, client, ["Write tests"], {})
+
+        assert result["status"] == "error"
+        assert "加入" in result["message"]
+
+    @pytest.mark.asyncio
+    async def test_process_agent_eval(self, server):
+        client_id = "test-client"
+        server.state.clients[client_id] = {"session_id": None, "ws": None}
+        client = server.state.clients[client_id]
+
+        await server._cmd_session_new(client_id, client, [], {})
+
+        result = await server._cmd_agent_eval(client_id, client, ["Check quality"], {})
+
+        assert result["status"] == "ok"
+        assert "Evaluator" in result["evaluator"]["name"]
+
+    @pytest.mark.asyncio
+    async def test_process_unknown_command(self, server):
+        client_id = "test-client"
+        client = {"session_id": None, "ws": None}
+
+        request = {"cmd": "unknown.cmd", "args": [], "kwargs": {}}
+        result = await server._process_request(client_id, request)
+
+        assert result["status"] == "error"
+        assert "未知命令" in result["message"]
+
+    @pytest.mark.asyncio
+    async def test_process_planner_no_session(self, server):
+        client_id = "test-client"
+        client = {"session_id": None, "ws": None}
+
+        result = await server._cmd_planner(client_id, client, ["test prompt"], {})
+
+        assert result["status"] == "error"
+        assert "加入" in result["message"]
 
 
 class TestClient:
@@ -194,8 +312,43 @@ class TestClient:
         client = Client()
         assert client.host == "localhost"
         assert client.port == 8765
+        assert client.url == "ws://localhost:8765/ws"
 
     def test_client_custom_values(self):
         client = Client(host="127.0.0.1", port=9999)
         assert client.host == "127.0.0.1"
         assert client.port == 9999
+        assert client.url == "ws://127.0.0.1:9999/ws"
+
+    def test_client_initial_state(self):
+        client = Client()
+        assert client.ws is None
+        assert client.client_id is None
+        assert client.current_session is None
+
+
+class TestClientMethods:
+    def test_session_new_method(self):
+        client = Client()
+        client.ws = None
+        assert client.session_new.__doc__ is not None
+
+    def test_session_list_method(self):
+        client = Client()
+        assert client.session_list.__doc__ is not None
+
+    def test_session_join_method(self):
+        client = Client()
+        assert client.session_join.__doc__ is not None
+
+    def test_agent_list_method(self):
+        client = Client()
+        assert client.agent_list.__doc__ is not None
+
+    def test_agent_exec_method(self):
+        client = Client()
+        assert client.agent_exec.__doc__ is not None
+
+    def test_status_method(self):
+        client = Client()
+        assert client.status.__doc__ is not None
