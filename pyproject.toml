@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agtw"
-version = "0.1.0"
+version = "0.2.2"
 description = "Agent Team Work - A git-style multi-agent coordination system"
 readme = "README.md"
 license = {text = "MIT"}
